@@ -20,7 +20,7 @@ from typing import Any
 
 from flask import Flask, jsonify, render_template, request, Response
 
-from drill import config, configstore, db, disk, lease, runner
+from drill import config, configstore, db, disk, lease, locate, runner
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
@@ -32,6 +32,7 @@ app = Flask(__name__, template_folder="templates", static_folder="static")
 def bootstrap() -> None:
     config.ensure_dirs()
     db.init_db()
+    locate.init_locate_db()
     configstore.seed_if_needed()
     # 启动即做一次恢复：认回租约 / token，处理上次未完成的切换与失联任务
     try:
@@ -59,6 +60,13 @@ signal.signal(signal.SIGINT, _sigterm_handler)
 
 @app.get("/")
 def index():
+    # 主演练页：有限网关试发定位故障依赖
+    return render_template("locate.html")
+
+
+@app.get("/ops")
+def legacy_console():
+    # 旧的网关维护 / 租约 / 发布控制台，功能与 API 全部保留
     return render_template("index.html", lease_ttl=config.LEASE_TTL)
 
 
@@ -377,6 +385,78 @@ def api_reset():
 
 
 # ---------------------------------------------------------------------------
+# 故障依赖定位演练
+# ---------------------------------------------------------------------------
+
+@app.get("/api/locate/routes")
+def api_locate_routes():
+    return jsonify(ok=True, routes=locate.list_routes())
+
+
+@app.post("/api/locate/routes/maintenance")
+def api_locate_route_maintenance():
+    data = request.get_json(silent=True) or {}
+    path = (data.get("path") or "").strip()
+    enabled = bool(data.get("enabled"))
+    try:
+        result = locate.set_route_enabled(path, enabled)
+    except locate.LocateError as exc:
+        return jsonify(ok=False, error=exc.message, error_code=exc.code), exc.status
+    return jsonify(ok=True, **result)
+
+
+@app.post("/api/locate/drills")
+def api_locate_create():
+    data = request.get_json(silent=True) or {}
+    try:
+        state = locate.create_drill(data)
+    except locate.LocateError as exc:
+        return jsonify(ok=False, error=exc.message, error_code=exc.code), exc.status
+    return jsonify(ok=True, drill=state), 201
+
+
+@app.get("/api/locate/drills")
+def api_locate_list():
+    return jsonify(ok=True, drills=locate.list_drills())
+
+
+@app.get("/api/locate/drills/<drill_id>")
+def api_locate_detail(drill_id: str):
+    try:
+        return jsonify(ok=True, drill=locate.get_state(drill_id))
+    except locate.LocateError as exc:
+        return jsonify(ok=False, error=exc.message, error_code=exc.code), exc.status
+
+
+@app.delete("/api/locate/drills/<drill_id>")
+def api_locate_delete(drill_id: str):
+    try:
+        return jsonify(locate.delete_drill(drill_id))
+    except locate.LocateError as exc:
+        return jsonify(ok=False, error=exc.message, error_code=exc.code), exc.status
+
+
+@app.post("/api/locate/drills/<drill_id>/rounds")
+def api_locate_send_round(drill_id: str):
+    data = request.get_json(silent=True) or {}
+    round_no = data.get("round_no")
+    if round_no is not None:
+        try:
+            round_no = int(round_no)
+        except (TypeError, ValueError):
+            return jsonify(ok=False, error="round_no 必须是整数"), 400
+    probe_ids = data.get("probe_ids", None)  # None => 用策略推荐批次
+    try:
+        state = locate.send_round(drill_id, round_no=round_no, probe_ids=probe_ids)
+    except locate.LocateError as exc:
+        payload = {"ok": False, "error": exc.message, "error_code": exc.code}
+        if exc.extra:
+            payload.update(exc.extra)
+        return jsonify(payload), exc.status
+    return jsonify(ok=True, drill=state)
+
+
+# ---------------------------------------------------------------------------
 # 网关：/gw/... 只读本地卷 current.json
 # ---------------------------------------------------------------------------
 
@@ -420,6 +500,28 @@ def gateway(subpath: str = ""):
         resp.status_code = 404
         resp.headers.update(headers)
         return resp
+
+    # 故障定位演练的注入点：仅当请求携带“本场 + 本探针”上下文时，
+    # 按该场固定故障与探针经过的服务决定是否回 502。
+    # 停用路由已在上面优先回 503；不带上下文的普通试发永远 200。
+    drill_id = request.args.get("_drill", "")
+    probe_id = request.args.get("_probe", "")
+    if drill_id and probe_id:
+        ctx = locate.gateway_probe_context(drill_id, probe_id)
+        if ctx is not None and ctx["probe"].get("route") == route_path and ctx["hit_fault"]:
+            resp = jsonify({
+                "ok": False,
+                "error": "bad_gateway",
+                "message": "探针链路上的依赖服务返回故障，网关应答 502",
+                "path": route_path,
+                "drill": drill_id,
+                "probe": probe_id,
+                "config_version": version,
+            })
+            resp.status_code = 502
+            resp.headers.update(headers)
+            resp.headers["X-Drill-Outcome"] = "fault-on-path"
+            return resp
 
     # “其余照常”：模拟上游正常应答
     payload = {
